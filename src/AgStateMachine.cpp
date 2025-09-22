@@ -9,12 +9,40 @@
 
 #define SENSOR_CO2_CALIB_COUNTDOWN_MAX 5 /** sec */
 
-#define RGB_COLOR_R 255, 0, 0   /** Red */
-#define RGB_COLOR_G 0, 255, 0   /** Green */
-#define RGB_COLOR_Y 255, 255, 0 /** Yellow */
-#define RGB_COLOR_O 255, 128, 0 /** Orange */
-#define RGB_COLOR_P 180, 0, 255 /** Purple */
-#define RGB_COLOR_CLEAR 0, 0, 0 /** No color */
+bool StateMachine::RGB::operator==(const RGB &other) const {
+  return r == other.r && g == other.g && b == other.b;
+}
+
+bool StateMachine::RGB::operator!=(const RGB &other) const {
+  return !(*this == other);
+}
+
+const StateMachine::RGB StateMachine::RGB_COLOR_B = {0, 0, 255}; /** Blue */
+const StateMachine::RGB StateMachine::RGB_COLOR_G = {0, 255, 0};   /** Green */
+const StateMachine::RGB StateMachine::RGB_COLOR_Y = {255, 255, 0}; /** Yellow */
+const StateMachine::RGB StateMachine::RGB_COLOR_O = {255, 128, 0}; /** Orange */
+const StateMachine::RGB StateMachine::RGB_COLOR_R = {255, 0, 0};   /** Red */
+const StateMachine::RGB StateMachine::RGB_COLOR_P = {180, 0, 255}; /** Purple */
+const StateMachine::RGB StateMachine::RGB_COLOR_CLEAR = {0, 0, 0}; /** No color */
+const StateMachine::RGB StateMachine::RGB_COLOR_W = {255, 255, 255}; /** White */
+
+// CO2 and PM2.5 are calculated to be spaced evenly on an exponential scale.
+const std::vector<StateMachine::ColumnSetting> StateMachine::LED_BAR_COMBO_COLUMNS = {
+    {Measurements::Temperature, 1, false, true, {15, 26, 30, 34, 38}},
+    {Measurements::Humidity, 1, false, true, {30, 60, 70, 80, 90}},
+    {static_cast<Measurements::MeasurementType>(-1), 1, false, false, {}},
+    {Measurements::CO2, 2, false, false, {526, 654, 813, 1010, 1256, 1561, 1941, 2413, 3000}},
+    {static_cast<Measurements::MeasurementType>(-1), 1, false, false, {}},
+    {Measurements::PM25, 2, true, false, {6, 10, 16, 25, 40, 63, 100, 158, 250}},
+    {static_cast<Measurements::MeasurementType>(-1), 1, false, false, {}},
+    {Measurements::TVOC, 1, true, false, {100, 200, 300, 400}},
+    {Measurements::NOx, 1, true, false, {100, 200, 300, 400}},
+};
+
+// CO2 level 3 is repeated so we can skip the pattern for that level
+const std::map<Measurements::MeasurementType, std::vector<int>> StateMachine::LED_BAR_LEVELS_LEGACY = {
+    {Measurements::CO2, {600, 800, 1000, 1000, 1250, 1500, 1750, 2000, 3000}},
+    {Measurements::PM25, {5, 9, 20, 35, 45, 55, 100, 125, 225}}};
 
 /**
  * @brief Animation LED bar with color
@@ -51,220 +79,167 @@ void StateMachine::ledStatusBlinkDelay(uint32_t ms) {
 /**
  * @brief Led bar show PM or CO2 led color status
  *
- * @return true if all led bar are used, false othwerwise
+ * @param statusLedColor
  */
-bool StateMachine::sensorhandleLeds(void) {
-  int totalLedUsed = 0;
+void StateMachine::sensorhandleLeds(RGB statusLedColor) {
   switch (config.getLedBarMode()) {
   case LedBarMode::LedBarModeCO2:
-    totalLedUsed = co2handleLeds();
+    handleLedsLegacy(statusLedColor, Measurements::CO2, [&]() {
+      return round(value.getAverage(Measurements::CO2));
+    });
     break;
   case LedBarMode::LedBarModePm:
-    totalLedUsed = pm25handleLeds();
+    handleLedsLegacy(statusLedColor, Measurements::PM25, [&]() {
+      const auto average = config.hasSensorSHT && config.isPMCorrectionEnabled() ? value.getCorrectedPM25(true) : value.getAverage(Measurements::PM25);
+      return round(average);
+    });
+    break;
+  case LedBarMode::LedBarModeCombo:
+    comboHandleLeds(statusLedColor, [&](Measurements::MeasurementType type) {
+      return value.getAverage(type);
+    });
     break;
   default:
     ag->ledBar.clear();
     break;
   }
+}
 
-  if (totalLedUsed == ag->ledBar.getNumberOfLeds()) {
-    return true;
+void StateMachine::comboHandleLeds(RGB statusLedColor, std::function<float(Measurements::MeasurementType)> getValueFunc) {
+  uint offset = 0;
+  for (const auto &column : LED_BAR_COMBO_COLUMNS) {
+    // Override first group with status LED otherwise there's not enough LEDs
+    if (offset == 0 && statusLedColor != RGB_COLOR_CLEAR) {
+      setColorWithPadding(offset, column.length, statusLedColor, 1, false);
+    }
+    else if (column.measurementType == -1) {
+      // Empty column
+      setColor(offset, RGB_COLOR_CLEAR, column.length);
+    }
+    else {
+      fillColumn(offset, column, getValueFunc(column.measurementType));
+    }
+
+    offset += column.length;
   }
-
-  // Clear the rest of unused led
-  int startIndex = totalLedUsed + 1;
-  for (int i = startIndex; i <= ag->ledBar.getNumberOfLeds(); i++) {
-    ag->ledBar.setColor(RGB_COLOR_CLEAR, ag->ledBar.getNumberOfLeds() - i);
-  }
-
-  return false;
 }
 
 /**
- * @brief Show CO2 LED status
+ * @brief Fills a column with color based on the measurement value.
  *
- * @return return total number of led that are used on the monitor
+ * @param offset The starting index of the column
+ * @param column The column settings including measurement type, length, alignment, extended colors, and cutoffs
+ * @param value The measurement value
+ *
+ * @details
+ * The LED strip is divided into columns, each representing a measurement type.
+ * The column starts at the given offset and has a length of `column.length`.
+ * The measurement value is compared against the cutoffs to determine the
+ * level, which then determines the color pattern. As the level increases, for
+ * each color it will fill one LED, then the next, until the column is filled,
+ * after which it will continue to the next color in the sequence.
+ * E.g. G, GG, GGG, Y, YY, YYY.
+ *
+ * It will also set the empty LEDs to clear any color that was previously set.
+ *
+ * Extended colors means it will start at blue rather than green, for values
+ * that go below the normal range.
  */
-int StateMachine::co2handleLeds(void) {
-  int totalUsed = ag->ledBar.getNumberOfLeds();
-  int co2Value = round(value.getAverage(Measurements::CO2));
-  if (co2Value <= 600) {
-    /** G; 1 */
-    ag->ledBar.setColor(RGB_COLOR_G, ag->ledBar.getNumberOfLeds() - 1);
-    totalUsed = 1;
-  } else if (co2Value <= 800) {
-    /** GG; 2 */
-    ag->ledBar.setColor(RGB_COLOR_G, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_G, ag->ledBar.getNumberOfLeds() - 2);
-    totalUsed = 2;
-  } else if (co2Value <= 1000) {
-    /** YYY; 3 */
-    ag->ledBar.setColor(RGB_COLOR_Y, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_Y, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_Y, ag->ledBar.getNumberOfLeds() - 3);
-    totalUsed = 3;
-  } else if (co2Value <= 1250) {
-    /** OOOO; 4 */
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 4);
-    totalUsed = 4;
-  } else if (co2Value <= 1500) {
-    /** OOOOO; 5 */
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 5);
-    totalUsed = 5;
-  } else if (co2Value <= 1750) {
-    /** RRRRRR; 6 */
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 5);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 6);
-    totalUsed = 6;
-  } else if (co2Value <= 2000) {
-    /** RRRRRRR; 7 */
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 5);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 6);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 7);
-    totalUsed = 7;
-  } else if (co2Value <= 3000) {
-    /** PPPPPPPP; 8 */
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 5);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 6);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 7);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 8);
-    totalUsed = 8;
-  } else { /** > 3000 */
-    /* PRPRPRPRP; 9 */
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 5);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 6);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 7);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 8);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 9);
-    totalUsed = 9;
+void StateMachine::fillColumn(uint offset, ColumnSetting column, float value) {
+  static const std::vector<RGB> colorSequence = {RGB_COLOR_B, RGB_COLOR_G, RGB_COLOR_Y, RGB_COLOR_O, RGB_COLOR_R, RGB_COLOR_P};
+
+  const uint level = std::distance(column.cutoffs.begin(), std::upper_bound(column.cutoffs.begin(), column.cutoffs.end(), value));
+  const auto colorIndex = (column.extendedColors ? 0 : 1) + level / column.length;
+  const auto color = colorSequence.at(min(colorIndex, colorSequence.size() - 1));
+  const auto numLeds = (level % column.length) + 1;
+  setColorWithPadding(offset, column.length, color, numLeds, column.alignRight);
+}
+
+void StateMachine::handleLedsLegacy(RGB statusLedColor, Measurements::MeasurementType measurementType,
+  std::function<int()> getValueFunc) {
+  static const std::vector<RGB> colorSequence = {RGB_COLOR_G, RGB_COLOR_Y, RGB_COLOR_O, RGB_COLOR_R, RGB_COLOR_P};
+
+  const auto value = getValueFunc();
+
+  // Calculate level
+  const auto levels = LED_BAR_LEVELS_LEGACY.at(measurementType);
+  uint level = std::distance(levels.begin() , std::lower_bound(levels.begin(), levels.end(), value));
+  const uint maxLevel = colorSequence.size() * 2 - 1;
+  // This should never happen but limit it for safety
+  level = std::min(level, maxLevel);
+
+  // Skip status LED and unused LED
+  const uint LED_OFFSET = 2;
+  // Offset should not exceed the number of LEDs but limit it just in case
+  const auto columnSize = std::max(0u, ag->ledBar.getNumberOfLeds() - LED_OFFSET);
+
+  // The last level is special, fill with purple and red
+  if (level == maxLevel) {
+    for (auto i = 0; i < columnSize; i++) {
+      setColor(LED_OFFSET + i, i % 2 ? RGB_COLOR_R : RGB_COLOR_P);
+    }
+  } else {
+    // CO2 skips a level
+    const auto numLeds = measurementType == Measurements::CO2 && level >= 3 ? level : level + 1;
+    setColorWithPadding(LED_OFFSET, columnSize, colorSequence.at(level / 2), numLeds, true);
   }
 
-  return totalUsed;
+  // Set status LED and unused LED
+  setColor(0, statusLedColor);
+  setColor(1, RGB_COLOR_CLEAR);
 }
 
 /**
- * @brief Show PM2.5 LED status
+ * @brief Sets the color of a range of LEDs with padding to the size of the column.
  *
- * @return return total number of led that are used on the monitor
+ * @param offset The starting index of the range
+ * @param columnSize The total size of the column
+ * @param color The color to set the LEDs to
+ * @param length The number of LEDs to set the color for
+ * @param alignRight If true, the color will be aligned to the right of the column
  */
-int StateMachine::pm25handleLeds(void) {
-  int totalUsed = ag->ledBar.getNumberOfLeds();
+void StateMachine::setColorWithPadding(uint offset, uint columnSize, RGB color, uint length, bool alignRight) {
+  uint paddingOffset;
+  uint colorOffset;
+  auto paddingLength = columnSize - length;
 
-  int pm25Value = round(value.getAverage(Measurements::PM25));
-  if (config.hasSensorSHT && config.isPMCorrectionEnabled()) {
-    pm25Value = round(value.getCorrectedPM25(true));
+  if (alignRight) {
+    paddingOffset = 0;
+    colorOffset = paddingLength;
+  }
+  else {
+    colorOffset = 0;
+     paddingOffset = length;
   }
 
-  if (pm25Value <= 5) {
-    /** G; 1 */
-    ag->ledBar.setColor(RGB_COLOR_G, ag->ledBar.getNumberOfLeds() - 1);
-    totalUsed = 1;
-  } else if (pm25Value <= 9) {
-    /** GG; 2 */
-    ag->ledBar.setColor(RGB_COLOR_G, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_G, ag->ledBar.getNumberOfLeds() - 2);
-    totalUsed = 2;
-  } else if (pm25Value <= 20) {
-    /** YYY; 3 */
-    ag->ledBar.setColor(RGB_COLOR_Y, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_Y, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_Y, ag->ledBar.getNumberOfLeds() - 3);
-    totalUsed = 3;
-  } else if (pm25Value <= 35) {
-    /** YYYY; 4 */
-    ag->ledBar.setColor(RGB_COLOR_Y, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_Y, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_Y, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_Y, ag->ledBar.getNumberOfLeds() - 4);
-    totalUsed = 4;
-  } else if (pm25Value <= 45) {
-    /** OOOOO; 5 */
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 5);
-    totalUsed = 5;
-  } else if (pm25Value <= 55) {
-    /** OOOOOO; 6 */
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 5);
-    ag->ledBar.setColor(RGB_COLOR_O, ag->ledBar.getNumberOfLeds() - 6);
-    totalUsed = 6;
-  } else if (pm25Value <= 100) {
-    /** RRRRRRR; 7 */
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 5);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 6);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 7);
-    totalUsed = 7;
-  } else if (pm25Value <= 125) {
-    /** RRRRRRRR; 8 */
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 5);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 6);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 7);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 8);
-    totalUsed = 8;
-  } else if (pm25Value <= 225) {
-    /** PPPPPPPPP; 9 */
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 5);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 6);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 7);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 8);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 9);
-    totalUsed = 9;
-  } else { /** > 225 */
-    /* PRPRPRPRP; 9 */
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 1);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 2);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 3);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 4);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 5);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 6);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 7);
-    ag->ledBar.setColor(RGB_COLOR_R, ag->ledBar.getNumberOfLeds() - 8);
-    ag->ledBar.setColor(RGB_COLOR_P, ag->ledBar.getNumberOfLeds() - 9);
-    totalUsed = 9;
-  }
+  setColor(offset + paddingOffset, RGB_COLOR_CLEAR, paddingLength);
+  setColor(offset + colorOffset, color, length);
+}
 
-  return totalUsed;
+/**
+ * @brief Sets the color of a range of LEDs.
+ *
+ * @param offset The starting index of the range
+ * @param color The color to set the LEDs to
+ * @param length The number of LEDs to set the color for
+ */
+void StateMachine::setColor(uint offset, RGB color, uint length) {
+  for (auto i = 0; i < length; i++) {
+    setColor(offset + i, color);
+  }
+}
+
+/**
+ * @brief Sets the color of a LED.
+ *
+ * @param ledNum The LED number to set the color for
+ * @param color The color to set the LED to
+ *
+ * @note This is a convenience wrapper to allow the RGB struct to be used instead of separate r, g, b parameters.
+ */
+void StateMachine::setColor(int ledNum, RGB color)
+{
+  ag->ledBar.setColor(color.r, color.g, color.b, ledNum);
 }
 
 void StateMachine::co2Calibration(void) {
@@ -386,21 +361,23 @@ void StateMachine::ledBarPowerUpTest(void) {
 void StateMachine::ledBarRunTest(void) {
   if (ag->isOne()) {
     disp.setText("LED Test", "running", ".....");
-    runLedTest('r');
+    runLedTest(RGB_COLOR_R);
     ag->ledBar.show();
     delay(1000);
-    runLedTest('g');
+    runLedTest(RGB_COLOR_G);
     ag->ledBar.show();
     delay(1000);
-    runLedTest('b');
+    runLedTest(RGB_COLOR_B);
     ag->ledBar.show();
     delay(1000);
-    runLedTest('w');
+    runLedTest(RGB_COLOR_W);
     ag->ledBar.show();
     delay(1000);
-    runLedTest('n');
+    runLedTest(RGB_COLOR_CLEAR);
     ag->ledBar.show();
     delay(1000);
+    testLegacyLeds();
+    testComboLeds();
   } else if (ag->isOpenAir()) {
     for (int i = 0; i < 100; i++) {
       ag->statusLed.setOn();
@@ -411,45 +388,50 @@ void StateMachine::ledBarRunTest(void) {
   }
 }
 
-void StateMachine::runLedTest(char color) {
-  int r = 0;
-  int g = 0;
-  int b = 0;
-  switch (color) {
-  case 'g':
-    g = 255;
-    break;
-  case 'y':
-    r = 255;
-    g = 255;
-    break;
-  case 'o':
-    r = 255;
-    g = 128;
-    break;
-  case 'r':
-    r = 255;
-    break;
-  case 'b':
-    b = 255;
-    break;
-  case 'w':
-    r = 255;
-    g = 255;
-    b = 255;
-    break;
-  case 'p':
-    r = 153;
-    b = 153;
-    break;
-  case 'z':
-    r = 102;
-    break;
-  case 'n':
-  default:
-    break;
+void StateMachine::testComboLeds(void) {
+  for (const auto &column : LED_BAR_COMBO_COLUMNS)
+  {
+    // Test a value lower than the first cutoff
+    testLedColumn(column.measurementType, 0);
+    ag->ledBar.show();
+    delay(1000);
+
+    for (const auto value : column.cutoffs) {
+      testLedColumn(column.measurementType, value);
+      ag->ledBar.show();
+      delay(1000);
+    }
   }
-  ag->ledBar.setColor(r, g, b);
+}
+
+void StateMachine::testLedColumn(Measurements::MeasurementType type, float value) {
+  comboHandleLeds(RGB_COLOR_W, [&](Measurements::MeasurementType innerType) {
+     return innerType == type ? value : 0;
+  });
+}
+
+void StateMachine::testLegacyLeds(void) {
+  for (const auto &x : LED_BAR_LEVELS_LEGACY) {
+    for (const auto value : x.second) {
+      testLegacyLedType(x.first, value);
+      ag->ledBar.show();
+      delay(1000);
+    }
+
+    // Test a value higher than the last cutoff
+    testLegacyLedType(x.first, INT_MAX);
+    delay(1000);
+  }
+}
+
+void StateMachine::testLegacyLedType(Measurements::MeasurementType type, int value) {
+  handleLedsLegacy(RGB_COLOR_W, type, [&]() {
+    return value;
+  });
+}
+
+void StateMachine::runLedTest(RGB color) {
+  setColor(0, color, ag->ledBar.getNumberOfLeds());
 }
 
 /**
@@ -767,10 +749,7 @@ void StateMachine::handleLeds(AgStateMachineState state) {
     /** Connection to WiFi network failed credentials incorrect encryption not
      * supported etc. */
     if (ag->isOne()) {
-      bool allUsed = sensorhandleLeds();
-      if (allUsed == false) {
-        ag->ledBar.setColor(255, 0, 0, 0);
-      }
+      sensorhandleLeds(RGB_COLOR_R);
     } else {
       ag->statusLed.setOff();
     }
@@ -780,10 +759,7 @@ void StateMachine::handleLeds(AgStateMachineState state) {
     /** Connected to WiFi network but the server cannot be reached through the
      * internet, e.g. blocked by firewall */
     if (ag->isOne()) {
-      bool allUsed = sensorhandleLeds();
-      if (allUsed == false) {
-        ag->ledBar.setColor(233, 183, 54, 0);
-      }
+      sensorhandleLeds((const RGB){233, 183, 54});
     } else {
       ag->statusLed.setOff();
     }
@@ -793,10 +769,7 @@ void StateMachine::handleLeds(AgStateMachineState state) {
     /** Server is reachable but there is some configuration issue to be fixed on
      * the server side */
     if (ag->isOne()) {
-      bool allUsed = sensorhandleLeds();
-      if (allUsed == false) {
-        ag->ledBar.setColor(139, 24, 248, 0);
-      }
+      sensorhandleLeds((const RGB){139, 24, 248});
     } else {
       ag->statusLed.setOff();
     }
@@ -804,7 +777,7 @@ void StateMachine::handleLeds(AgStateMachineState state) {
   }
   case AgStateMachineNormal: {
     if (ag->isOne()) {
-      sensorhandleLeds();
+      sensorhandleLeds(RGB_COLOR_CLEAR);
     } else {
       ag->statusLed.setOff();
     }

@@ -81,6 +81,9 @@ enum LedBarMode {
 
   /** Use LED bar for show CO2 value level */
   LedBarModeCO2,
+
+  /** Use LED bar for show a combination of sensor value levels */
+  LedBarModeCombo,
 };
 
 enum ConfigurationControl {

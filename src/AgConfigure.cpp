@@ -19,6 +19,7 @@ const char *LED_BAR_MODE_NAMES[] = {
     [LedBarModeOff] = "off",
     [LedBarModePm] = "pm",
     [LedBarModeCO2] = "co2",
+    [LedBarModeCombo] = "combo",
 };
 
 const char *PM_CORRECTION_ALGORITHM_NAMES[] = {
@@ -103,6 +104,8 @@ String Configuration::getLedBarModeName(LedBarMode mode) {
     return String(LED_BAR_MODE_NAMES[LedBarModePm]);
   } else if (mode == LedBarModeCO2) {
     return String(LED_BAR_MODE_NAMES[LedBarModeCO2]);
+  } else if (mode == LedBarModeCombo) {
+    return String(LED_BAR_MODE_NAMES[LedBarModeCombo]);
   }
   return String("unknown");
 }
@@ -635,7 +638,8 @@ bool Configuration::parse(String data, bool isLocal) {
     String mode = root[jprop_ledBarMode];
     if (mode == getLedBarModeName(LedBarMode::LedBarModeCO2) ||
         mode == getLedBarModeName(LedBarMode::LedBarModeOff) ||
-        mode == getLedBarModeName(LedBarMode::LedBarModePm)) {
+        mode == getLedBarModeName(LedBarMode::LedBarModePm) ||
+        mode == getLedBarModeName(LedBarMode::LedBarModeCombo)) {
       String oldMode = jconfig[jprop_ledBarMode];
       if (mode != oldMode) {
         jconfig[jprop_ledBarMode] = mode;
@@ -1049,6 +1053,9 @@ LedBarMode Configuration::getLedBarMode(void) {
   if (mode == getLedBarModeName(LedBarModePm)) {
     return LedBarModePm;
   }
+  if (mode == getLedBarModeName(LedBarModeCombo)) {
+    return LedBarModeCombo;
+  }
   return LedBarModeOff;
 }
 
@@ -1257,7 +1264,8 @@ void Configuration::toConfig(const char *buf) {
     String mode = jconfig[jprop_ledBarMode];
     if (mode != getLedBarModeName(LedBarMode::LedBarModeCO2) &&
         mode != getLedBarModeName(LedBarMode::LedBarModeOff) &&
-        mode != getLedBarModeName(LedBarMode::LedBarModePm)) {
+        mode != getLedBarModeName(LedBarMode::LedBarModePm) &&
+        mode != getLedBarModeName(LedBarMode::LedBarModeCombo)) {
       isConfigFieldInvalid = true;
     } else {
       isConfigFieldInvalid = false;

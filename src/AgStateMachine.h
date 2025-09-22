@@ -6,9 +6,38 @@
 #include "AgConfigure.h"
 #include "Main/PrintLog.h"
 #include "App/AppDef.h"
+#include <map>
+#include <functional>
 
 class StateMachine : public PrintLog {
 private:
+  struct RGB {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    bool operator==(const RGB &other) const;
+    bool operator!=(const RGB &other) const;
+  };
+
+  struct ColumnSetting {
+    Measurements::MeasurementType measurementType;
+    int length;
+    bool alignRight;
+    bool extendedColors;
+    std::vector<int> cutoffs;
+  };
+
+  static const RGB RGB_COLOR_B;
+  static const RGB RGB_COLOR_G;
+  static const RGB RGB_COLOR_Y;
+  static const RGB RGB_COLOR_O;
+  static const RGB RGB_COLOR_R;
+  static const RGB RGB_COLOR_P;
+  static const RGB RGB_COLOR_CLEAR;
+  static const RGB RGB_COLOR_W;
+  static const std::vector<ColumnSetting> LED_BAR_COMBO_COLUMNS;
+  static const std::map<Measurements::MeasurementType, std::vector<int>> LED_BAR_LEVELS_LEGACY;
+
   // AgStateMachineState state;
   AgStateMachineState ledState;
   AgStateMachineState dispState;
@@ -24,14 +53,23 @@ private:
 
   void ledBarSingleLedAnimation(uint8_t r, uint8_t g, uint8_t b);
   void ledStatusBlinkDelay(uint32_t delay);
-  bool sensorhandleLeds(void);
-  int co2handleLeds(void);
-  int pm25handleLeds(void);
+  void sensorhandleLeds(RGB statusLedColor);
+  void comboHandleLeds(RGB statusLedColor, std::function<float(Measurements::MeasurementType)> getValueFunc);
+  void fillColumn(uint offset, ColumnSetting column, float value);
+  void handleLedsLegacy(RGB statusLedColor, Measurements::MeasurementType measurementType,
+     std::function<int()> getValueFunc);
+  void setColorWithPadding(uint offset, uint columnSize, RGB color, uint length, bool alignRight);
+  void setColor(uint offset, RGB color, uint length);
+  void setColor(int ledNum, RGB color);
   void co2Calibration(void);
   void ledBarTest(void);
   void ledBarPowerUpTest(void);
   void ledBarRunTest(void);
-  void runLedTest(char color);
+  void testComboLeds(void);
+  void testLedColumn(Measurements::MeasurementType type, float value);
+  void testLegacyLeds(void);
+  void testLegacyLedType(Measurements::MeasurementType type, int value);
+  void runLedTest(RGB color);
 
 public:
   StateMachine(OledDisplay &disp, Stream &log,
